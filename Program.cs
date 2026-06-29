@@ -1,8 +1,13 @@
-﻿using System.IO;
+﻿using System.Collections.Concurrent;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using LZ4;
-using static System.Runtime.InteropServices.JavaScript.JSType;
+using SixLabors.ImageSharp;
+using SixLabors.ImageSharp.Formats.Png;
+using SixLabors.ImageSharp.PixelFormats;
+using Pfim;
 
 namespace MetaphorAPKPack
 {
@@ -31,33 +36,219 @@ namespace MetaphorAPKPack
             public byte[] compFileData;
         }
 
+        public static readonly string OutputRoot = AppContext.BaseDirectory;
+        public static readonly string ExtractedRoot = Path.Combine(AppContext.BaseDirectory, "Extracted");
+        public static readonly int DegreeOfParallelism = Math.Max(1, Environment.ProcessorCount);
+        private static readonly ConcurrentDictionary<string, byte> usedFileNamesThisRun = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentDictionary<string, string> writtenHashToPath = new ConcurrentDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly ConcurrentQueue<string> extractionLogLines = new ConcurrentQueue<string>();
+
         public static async Task Main(string[] args)
         {
             if (args.Length == 0)
             {
-                Console.WriteLine("Drag and drop an APK file or folder full of .dds files onto the application.\nPress any key to exit...");
+                Console.WriteLine("Drag and drop an APK file, a folder full of .dds files, or a folder containing APKs (searched recursively) onto the application.\nPress any key to exit...");
                 Console.ReadKey();
                 return;
             }
 
-            string input = args[0];
+            Console.WriteLine($"Repacked APKs will be written to: {OutputRoot}");
+            Console.WriteLine($"Extracted DDS files will be written to: {ExtractedRoot}");
 
+            string extractionLogPath = Path.Combine(ExtractedRoot, "ExtractionLog.txt");
+            if (File.Exists(extractionLogPath))
+            {
+                File.Delete(extractionLogPath);
+            }
+
+            foreach (string input in args)
+            {
+                await ProcessInput(input);
+            }
+
+            if (!extractionLogLines.IsEmpty)
+            {
+                Directory.CreateDirectory(ExtractedRoot);
+                File.AppendAllLines(extractionLogPath, extractionLogLines);
+            }
+
+            Console.WriteLine("Done. Press any key to exit...");
+            Console.ReadKey();
+        }
+
+        public static async Task ProcessInput(string input)
+        {
             if (File.Exists(input) && Path.GetExtension(input).Equals(".apk", StringComparison.OrdinalIgnoreCase))
             {
-                List<TextureEntry> structList = await ProcessAPK(input);
-                await DumpDDSFiles(structList, input);
+                await ExtractApk(input);
             }
             else if (Directory.Exists(input))
             {
-                string outputApkName = Path.Combine(Path.GetDirectoryName(input), Path.GetFileName(input) + ".apk");
-                List<TextureEntryCompressed> structList = ProcessDDSFolder(input);
-                WriteDDSToAPK(structList, outputApkName);
+                if (IsDdsPackFolder(input))
+                {
+                    PackFolder(input);
+                }
+                else
+                {
+                    await BatchExtractApks(input);
+                }
             }
             else
             {
-                Console.WriteLine("Invalid input. Provide either a .apk file or a folder with dds files and a filelist.txt\nPress any key to exit...");
-                Console.ReadKey();
+                Console.WriteLine($"Skipping invalid input: {input}");
+            }
+        }
+
+        public static bool IsDdsPackFolder(string folderPath)
+        {
+            return File.Exists(Path.Combine(folderPath, "FileList.txt"))
+                && Directory.GetFiles(folderPath, "*.dds").Length > 0;
+        }
+
+        public static async Task BatchExtractApks(string rootPath)
+        {
+            Console.WriteLine($"Scanning {rootPath} for .apk files...");
+
+            List<string> apkPaths = SafeEnumerateFiles(rootPath, "*.apk").ToList();
+
+            if (apkPaths.Count == 0)
+            {
+                Console.WriteLine($"No .apk files found under {rootPath}");
                 return;
+            }
+
+            Console.WriteLine($"Found {apkPaths.Count} APK file(s). Extracting with up to {DegreeOfParallelism} threads...");
+
+            int succeeded = 0;
+            int failed = 0;
+
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = DegreeOfParallelism };
+
+            await Parallel.ForEachAsync(apkPaths, parallelOptions, async (apkPath, cancellationToken) =>
+            {
+                bool ok = await ExtractApk(apkPath);
+                if (ok)
+                {
+                    Interlocked.Increment(ref succeeded);
+                }
+                else
+                {
+                    Interlocked.Increment(ref failed);
+                }
+            });
+
+            Console.WriteLine($"Batch extraction finished: {succeeded} succeeded, {failed} failed.");
+        }
+
+        public static async Task<bool> ExtractApk(string apkPath)
+        {
+            try
+            {
+                Console.WriteLine($"Extracting {apkPath} -> {ExtractedRoot}");
+                List<TextureEntry> structList = await ProcessAPK(apkPath);
+                await DumpDDSFilesAsPng(structList, apkPath, ExtractedRoot);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to extract {apkPath}: {ex.Message}");
+                return false;
+            }
+        }
+
+        public static async Task ConvertAndSavePng(byte[] ddsBytes, string pngPath, CancellationToken ct = default)
+        {
+            using var stream = new MemoryStream(ddsBytes);
+            using var dds = Pfimage.FromStream(stream);
+            dds.Decompress();
+
+            Image image;
+
+            if (dds.Format == ImageFormat.Rgba32)
+            {
+                image = Image.LoadPixelData<Bgra32>(dds.Data, dds.Width, dds.Height);
+            }
+            else if (dds.Format == ImageFormat.Rgb24)
+            {
+                image = Image.LoadPixelData<Bgr24>(dds.Data, dds.Width, dds.Height);
+            }
+            else
+            {
+                throw new NotSupportedException($"Unsupported DDS pixel format: {dds.Format}");
+            }
+
+            using (image)
+            {
+                await image.SaveAsPngAsync(pngPath, ct);
+            }
+        }
+
+        public static bool PackFolder(string folderPath)
+        {
+            try
+            {
+                string outputApkName = Path.Combine(OutputRoot, Path.GetFileName(folderPath) + ".apk");
+                List<TextureEntryCompressed> structList = ProcessDDSFolder(folderPath);
+                WriteDDSToAPK(structList, outputApkName);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to pack {folderPath}: {ex.Message}");
+                return false;
+            }
+        }
+
+        public static string GetUniqueFileName(string desiredFileName)
+        {
+            string candidate = desiredFileName;
+            int suffix = 2;
+
+            while (!usedFileNamesThisRun.TryAdd(candidate, 0))
+            {
+                string baseName = Path.GetFileNameWithoutExtension(desiredFileName);
+                string extension = Path.GetExtension(desiredFileName);
+                candidate = $"{baseName}_{suffix}{extension}";
+                suffix++;
+            }
+
+            return candidate;
+        }
+
+        public static IEnumerable<string> SafeEnumerateFiles(string rootPath, string searchPattern)
+        {
+            var pendingDirs = new Stack<string>();
+            pendingDirs.Push(rootPath);
+
+            while (pendingDirs.Count > 0)
+            {
+                string currentDir = pendingDirs.Pop();
+                string[] subDirs = Array.Empty<string>();
+                string[] matchedFiles = Array.Empty<string>();
+
+                try
+                {
+                    matchedFiles = Directory.GetFiles(currentDir, searchPattern);
+                    subDirs = Directory.GetDirectories(currentDir);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    continue;
+                }
+                catch (IOException)
+                {
+                    continue;
+                }
+
+                foreach (string file in matchedFiles)
+                {
+                    yield return file;
+                }
+
+                foreach (string subDir in subDirs)
+                {
+                    pendingDirs.Push(subDir);
+                }
             }
         }
 
@@ -106,41 +297,69 @@ namespace MetaphorAPKPack
             return TextureEntries;
         }
 
-        public static async Task DumpDDSFiles(List<TextureEntry> TextureEntries, string filePath)
+        public static async Task DumpDDSFilesAsPng(List<TextureEntry> TextureEntries, string filePath, string outputDir)
         {
+            var toConvert = new List<(string savedFileName, string outputFilePath, byte[] ddsData)>();
+
             using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
             {
-                List<string> FileNames = new List<string>();
+                Directory.CreateDirectory(outputDir);
 
                 foreach (var data in TextureEntries)
                 {
-                    FileNames.Add(data.filename);
+                    string originalFileName = Path.GetFileName(data.filename.TrimEnd('\0'));
 
                     fs.Seek(data.offset, SeekOrigin.Begin);
 
                     byte[] compressedFile = new byte[data.fileSize];
                     await fs.ReadAsync(compressedFile, 0, data.fileSize);
 
-                    string outputFilePath = Path.Combine(Path.GetDirectoryName(filePath), Path.GetFileNameWithoutExtension(filePath), data.filename.TrimEnd('\0'));
-
-                    Directory.CreateDirectory(Path.GetDirectoryName(outputFilePath));
-
                     int decompressedSize = BitConverter.ToInt32(compressedFile, 0x0C);
                     int compressedSize = BitConverter.ToInt32(compressedFile, 0x20);
 
-                    // Extract the compressed data starting from 0x30
                     byte[] compressedData = new byte[compressedSize];
                     Array.Copy(compressedFile, 0x30, compressedData, 0, compressedSize);
 
                     byte[] decompressedData = LZ4Codec.Decode(compressedData, 0, compressedSize, decompressedSize);
 
-                    await File.WriteAllBytesAsync(outputFilePath, decompressedData);
-                    Console.WriteLine($"Saved {data.filename.TrimEnd('\0')} to {outputFilePath}");
-                }
+                    string hash = Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(decompressedData));
 
-                string txtPath = Path.Combine(Path.GetDirectoryName(filePath), Path.GetFileNameWithoutExtension(filePath), "FileList.txt");
-                File.WriteAllLines(txtPath, FileNames);
+                    if (writtenHashToPath.ContainsKey(hash))
+                    {
+                        Console.WriteLine($"Skipping {originalFileName} (duplicate of {Path.GetFileName(writtenHashToPath[hash])})");
+                        continue;
+                    }
+
+                    string savedFileName = Path.ChangeExtension(GetUniqueFileName(originalFileName), ".png");
+                    string outputFilePath = Path.Combine(outputDir, savedFileName);
+
+                    if (!writtenHashToPath.TryAdd(hash, outputFilePath))
+                    {
+                        Console.WriteLine($"Skipping {originalFileName} (duplicate of {Path.GetFileName(writtenHashToPath[hash])})");
+                        continue;
+                    }
+
+                    extractionLogLines.Enqueue($"{savedFileName}\t{Path.GetFileName(filePath)}\t{originalFileName}");
+                    toConvert.Add((savedFileName, outputFilePath, decompressedData));
+                }
             }
+
+            Console.WriteLine($"Converting {toConvert.Count} file(s) to PNG with up to {DegreeOfParallelism} threads...");
+
+            var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = DegreeOfParallelism };
+
+            await Parallel.ForEachAsync(toConvert, parallelOptions, async (entry, ct) =>
+            {
+                try
+                {
+                    await ConvertAndSavePng(entry.ddsData, entry.outputFilePath, ct);
+                    Console.WriteLine($"Saved {entry.savedFileName}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Skipping {entry.savedFileName}: {ex.Message}");
+                }
+            });
         }
 
         public static List<TextureEntryCompressed> ProcessDDSFolder(string folderPath)
@@ -176,7 +395,7 @@ namespace MetaphorAPKPack
         public static void WriteDDSToAPK(List<TextureEntryCompressed> structList, string outputFilePath)
         {
             Console.WriteLine($"Creating Directory {Path.GetDirectoryName(outputFilePath)}");
-            Directory.CreateDirectory(Path.GetDirectoryName(outputFilePath));
+            Directory.CreateDirectory(Path.GetDirectoryName(outputFilePath)!);
 
             List<TextureEntryCompressed> CompressedDataHolder = new List<TextureEntryCompressed>();
 
